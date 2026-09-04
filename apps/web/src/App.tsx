@@ -231,10 +231,15 @@ function ERPConnect({ onData, onClose }: { onData: (data: ERPData) => void; onCl
     if (!bridgeId || !username.trim() || !password || !captcha.trim()) return;
     setBusy(true); setStatus('Logging into KLU ERP…');
     try {
-      const result = await apiCall<{ authenticated: boolean; message: string }>('/api/erp/login', {
+      const result = await apiCall<{ authenticated: boolean; message: string; bridgeId?: string }>('/api/erp/login', {
         method: 'POST', body: JSON.stringify({ bridgeId, username: username.trim(), password, captcha: captcha.trim() }),
       });
+      // Vercel is stateless. A successful login returns a fresh encrypted
+      // bridge token containing the updated ERP cookies/localStorage. Replace
+      // the pre-login token before making any attendance/timetable requests.
+      if (result.bridgeId) setBridgeId(result.bridgeId);
       if (!result.authenticated) { setStatus(result.message); return; }
+      const authenticatedBridgeId = result.bridgeId || bridgeId;
       if (rememberMe) {
         localStorage.setItem('klu-attend-remember-me', 'true');
         localStorage.setItem('klu-attend-remembered-username', username.trim());
@@ -245,7 +250,7 @@ function ERPConnect({ onData, onClose }: { onData: (data: ERPData) => void; onCl
         localStorage.removeItem('klu-attend-remembered-password');
       }
       setPassword(''); setAuthenticated(true); setStatus('Logged in. Reading the real ERP Attendance Register…');
-      const data = await apiCall<{ academicYearOptions: Option[]; semesterOptions: Option[] }>(`/api/erp/attendance/options/${bridgeId}`);
+      const data = await apiCall<{ academicYearOptions: Option[]; semesterOptions: Option[] }>(`/api/erp/attendance/options/${authenticatedBridgeId}`);
       setAcademicYears(data.academicYearOptions); setSemesters(data.semesterOptions || []);
       const firstYear = data.academicYearOptions[0]?.value || '';
       setAcademicYear(firstYear); setSemester(data.semesterOptions?.[0]?.value || '');

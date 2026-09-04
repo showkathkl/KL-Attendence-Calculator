@@ -105,36 +105,114 @@ type TimetableEntry = {
   faculty_name?: string;
 };
 
-type Bridge = {
-  context: BrowserContext;
-  page: Page;
+type BridgePayload = {
+  version: 1;
   expiresAt: number;
   authenticated: boolean;
+  url: string;
+  storageState: Awaited<ReturnType<BrowserContext['storageState']>>;
 };
 
-const bridges = new Map<string, Bridge>();
+type Bridge = BridgePayload & {
+  id: string;
+  context: BrowserContext;
+  page: Page;
+};
 
-function newId() {
-  return crypto.randomBytes(24).toString('hex');
+// Vercel functions are stateless: a later request can run on a different
+// function instance, so keeping Playwright BrowserContext objects in a module
+// level Map is not reliable. The bridge token below contains an encrypted
+// Playwright storageState (cookies + localStorage) and the current ERP URL.
+// Each API request reconstructs a short-lived BrowserContext from that state,
+// then returns an updated token when the ERP session changes.
+const BRIDGE_SECRET = process.env.ERP_BRIDGE_SECRET || (process.env.VERCEL ? '' : 'local-development-erp-bridge-secret');
+const BRIDGE_KEY = BRIDGE_SECRET ? crypto.createHash('sha256').update(BRIDGE_SECRET).digest() : null;
+
+function requireBridgeKey() {
+  if (!BRIDGE_KEY) {
+    throw new Error('ERP_BRIDGE_SECRET is not configured. Add a strong random ERP_BRIDGE_SECRET environment variable in Vercel.');
+  }
+  return BRIDGE_KEY;
 }
 
-async function cleanup() {
-  const now = Date.now();
-  for (const [id, bridge] of bridges) {
-    if (bridge.expiresAt <= now) {
-      await bridge.context.close().catch(() => undefined);
-      bridges.delete(id);
+function base64Url(buffer: Buffer) {
+  return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function fromBase64Url(value: string) {
+  const padded = value.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((value.length + 3) % 4);
+  return Buffer.from(padded, 'base64');
+}
+
+function encodeBridge(payload: BridgePayload) {
+  const key = requireBridgeKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([
+    cipher.update(JSON.stringify(payload), 'utf8'),
+    cipher.final(),
+  ]);
+  const tag = cipher.getAuthTag();
+  return [iv, tag, encrypted].map(base64Url).join('.');
+}
+
+function decodeBridge(id: string): BridgePayload {
+  const key = requireBridgeKey();
+  const parts = id.split('.');
+  if (parts.length !== 3) throw new Error('Invalid ERP bridge. Start a new connection.');
+  try {
+    const iv = fromBase64Url(parts[0]);
+    const tag = fromBase64Url(parts[1]);
+    const encrypted = fromBase64Url(parts[2]);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    const plaintext = Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
+    const payload = JSON.parse(plaintext) as BridgePayload;
+    if (payload.version !== 1 || !payload.storageState || typeof payload.url !== 'string') {
+      throw new Error('Invalid ERP bridge payload.');
     }
+    if (payload.expiresAt <= Date.now()) throw new Error('ERP bridge expired. Start a new connection.');
+    return payload;
+  } catch (error) {
+    if (error instanceof Error && /expired/i.test(error.message)) throw error;
+    throw new Error('Invalid or expired ERP bridge. Start a new connection.');
   }
 }
 
-function getBridge(id: string) {
-  const bridge = bridges.get(id);
-  if (!bridge || bridge.expiresAt <= Date.now()) {
-    throw new Error('ERP bridge expired. Start a new connection.');
-  }
-  bridge.expiresAt = Date.now() + SESSION_TTL_MS;
-  return bridge;
+async function getBridge(id: string): Promise<Bridge> {
+  const payload = decodeBridge(id);
+  const browser = await getSharedBrowser();
+  const context = await browser.newContext({
+    storageState: payload.storageState,
+    ignoreHTTPSErrors: false,
+  });
+  await applyFastRouting(context);
+  const page = await context.newPage();
+  page.setDefaultTimeout(15_000);
+  await page.goto(payload.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await page.waitForTimeout(300);
+  return {
+    ...payload,
+    id,
+    context,
+    page,
+    expiresAt: Date.now() + SESSION_TTL_MS,
+  };
+}
+
+async function persistBridge(bridge: Bridge) {
+  const storageState = await bridge.context.storageState();
+  return encodeBridge({
+    version: 1,
+    expiresAt: Date.now() + SESSION_TTL_MS,
+    authenticated: bridge.authenticated,
+    url: bridge.page.url() || bridge.url,
+    storageState,
+  });
+}
+
+async function closeBridgeContext(bridge: Bridge) {
+  await bridge.context.close().catch(() => undefined);
 }
 
 async function visibleLocator(page: Page, selectors: string[]) {
@@ -209,28 +287,30 @@ async function waitForLoginResult(page: Page) {
 }
 
 export async function startERPBridge() {
-  await cleanup();
-
   const browser = await getSharedBrowser();
   const context = await browser.newContext({ ignoreHTTPSErrors: false });
   await applyFastRouting(context);
   const page = await context.newPage();
   page.setDefaultTimeout(15_000);
 
-  await page.goto(ERP_BASE, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-  await page.waitForTimeout(300);
+  try {
+    await page.goto(ERP_BASE, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await page.waitForTimeout(300);
 
-  const id = newId();
-  bridges.set(id, {
-    context,
-    page,
-    expiresAt: Date.now() + SESSION_TTL_MS,
-    authenticated: false,
-  });
+    const token = encodeBridge({
+      version: 1,
+      expiresAt: Date.now() + SESSION_TTL_MS,
+      authenticated: false,
+      url: page.url() || ERP_BASE,
+      storageState: await context.storageState(),
+    });
 
-  return {
-    bridgeId: id,
-  };
+    return { bridgeId: token };
+  } finally {
+    // The encrypted storageState is the persistent bridge. Do not leave a
+    // Playwright context attached to this serverless invocation.
+    await context.close().catch(() => undefined);
+  }
 }
 
 export async function submitERPLogin(input: {
@@ -239,7 +319,7 @@ export async function submitERPLogin(input: {
   password: string;
   captcha?: string;
 }) {
-  const bridge = getBridge(input.bridgeId);
+  const bridge = await getBridge(input.bridgeId);
   const { page } = bridge;
 
   const usernameFilled = await fillVisible(page, [
@@ -297,6 +377,8 @@ export async function submitERPLogin(input: {
       rejected,
       erpError,
     });
+    const updatedBridgeId = await persistBridge(bridge);
+    await closeBridgeContext(bridge);
     return {
       authenticated: false,
       requiresCaptcha: Boolean(await visibleLocator(page, [
@@ -308,15 +390,19 @@ export async function submitERPLogin(input: {
       message: erpError || (rejected
         ? 'KLU ERP rejected the username, password or verification code.'
         : 'ERP login was not completed. Check the credentials and verification code.'),
+      bridgeId: await persistBridge(bridge),
     };
   }
 
   bridge.authenticated = true;
+  const updatedBridgeId = await persistBridge(bridge);
+  await closeBridgeContext(bridge);
   return {
     authenticated: true,
     requiresCaptcha: false,
     requiresMfa: false,
     message: 'ERP login succeeded. Opening Attendance Register…',
+    bridgeId: updatedBridgeId,
   };
 }
 
@@ -1060,7 +1146,7 @@ async function extractTimetable(page: Page, extraSources: string[] = []): Promis
 }
 
 export async function getERPTimetable(bridgeId: string, academicYear: string, semester: string) {
-  const bridge = getBridge(bridgeId);
+  const bridge = await getBridge(bridgeId);
   if (!bridge.authenticated) throw new Error('ERP session is not authenticated.');
   const page = await bridge.context.newPage();
   page.setDefaultTimeout(15_000);
@@ -1118,26 +1204,29 @@ export async function getERPTimetable(bridgeId: string, academicYear: string, se
   } finally {
     page.off('response', onResponse);
     await page.close().catch(() => undefined);
+    await closeBridgeContext(bridge);
   }
 }
 
 export async function getAttendanceYearOptions(bridgeId: string) {
-  const bridge = getBridge(bridgeId);
+  const bridge = await getBridge(bridgeId);
   if (!bridge.authenticated) throw new Error('ERP session is not authenticated.');
 
   const { page } = bridge;
   const url = await ensureAttendancePage(page);
   const filters = await readAttendanceFilters(page);
 
-  return {
+  const result = {
     academicYearOptions: filters.academicOptions,
     semesterOptions: filters.semesterOptions,
     url,
   };
+  await closeBridgeContext(bridge);
+  return result;
 }
 
 export async function getAttendanceSemesterOptions(bridgeId: string, academicYear: string) {
-  const bridge = getBridge(bridgeId);
+  const bridge = await getBridge(bridgeId);
   if (!bridge.authenticated) throw new Error('ERP session is not authenticated.');
   const { page } = bridge;
   await ensureAttendancePage(page);
@@ -1147,7 +1236,9 @@ export async function getAttendanceSemesterOptions(bridgeId: string, academicYea
   if (!semester) throw new Error('The ERP Semester dropdown was not found after selecting the Academic Year.');
   const semesterOptions = await readSelect(semester);
   if (!semesterOptions.length) throw new Error(`No Semester options were returned by KLU ERP for ${selectedYear.label}.`);
-  return { academicYear: selectedYear, semesterOptions };
+  const result = { academicYear: selectedYear, semesterOptions };
+  await closeBridgeContext(bridge);
+  return result;
 }
 
 async function clickSearch(page: Page) {
@@ -1180,7 +1271,7 @@ export async function syncERPAttendance(
   academicYear: string,
   semester: string,
 ) {
-  const bridge = getBridge(bridgeId);
+  const bridge = await getBridge(bridgeId);
   if (!bridge.authenticated) throw new Error('ERP session is not authenticated.');
 
   const { page } = bridge;
@@ -1218,7 +1309,7 @@ export async function syncERPAttendance(
     );
   }
 
-  return {
+  const result = {
     courses,
     fetched_at: new Date().toISOString(),
     source_url: page.url() || sourceUrl,
@@ -1226,41 +1317,47 @@ export async function syncERPAttendance(
     academic_year: selectedYear.label,
     semester: selectedSemester.label,
   };
+  await closeBridgeContext(bridge);
+  return result;
 }
 
 export async function getERPState(bridgeId: string) {
-  const bridge = getBridge(bridgeId);
+  const bridge = decodeBridge(bridgeId);
   return {
     authenticated: bridge.authenticated,
     expiresAt: new Date(bridge.expiresAt).toISOString(),
-    url: bridge.page.url(),
+    url: bridge.url,
   };
 }
 
 export async function getCaptchaScreenshot(bridgeId: string) {
-  const bridge = getBridge(bridgeId);
+  const bridge = await getBridge(bridgeId);
   const { page } = bridge;
-  const input = await visibleLocator(page, [
-    'input[placeholder*="verification" i]',
-    'input[name*="captcha" i]',
-    'input[id*="captcha" i]',
-  ]);
+  try {
+    const input = await visibleLocator(page, [
+      'input[placeholder*="verification" i]',
+      'input[name*="captcha" i]',
+      'input[id*="captcha" i]',
+    ]);
 
-  if (input) {
-    const parent = input.locator('xpath=..');
-    const img = parent.locator('img:visible').first();
-    if (await img.count()) return await img.screenshot({ type: 'png' });
-  }
-
-  const images = page.locator('img:visible');
-  for (let i = 0; i < Math.min(await images.count(), 20); i++) {
-    const img = images.nth(i);
-    const box = await img.boundingBox().catch(() => null);
-    if (box && box.width >= 60 && box.height >= 20 && box.width <= 600 && box.height <= 300) {
-      return await img.screenshot({ type: 'png' });
+    if (input) {
+      const parent = input.locator('xpath=..');
+      const img = parent.locator('img:visible').first();
+      if (await img.count()) return await img.screenshot({ type: 'png' });
     }
+
+    const images = page.locator('img:visible');
+    for (let i = 0; i < Math.min(await images.count(), 20); i++) {
+      const img = images.nth(i);
+      const box = await img.boundingBox().catch(() => null);
+      if (box && box.width >= 60 && box.height >= 20 && box.width <= 600 && box.height <= 300) {
+        return await img.screenshot({ type: 'png' });
+      }
+    }
+    return null;
+  } finally {
+    await closeBridgeContext(bridge);
   }
-  return null;
 }
 
 // Called once at server boot so the (slow, ~0.5-2s) Chromium process is
@@ -1270,9 +1367,8 @@ export async function warmUpERPBrowser() {
   try { await getSharedBrowser(); } catch { /* first real request will retry */ }
 }
 
-export async function closeERPBridge(bridgeId: string) {
-  const bridge = bridges.get(bridgeId);
-  if (!bridge) return;
-  await bridge.context.close().catch(() => undefined);
-  bridges.delete(bridgeId);
+export async function closeERPBridge(_bridgeId: string) {
+  // Nothing persistent is kept in the serverless invocation. The browser
+  // context is closed at the end of every request; the encrypted token simply
+  // expires naturally after SESSION_TTL_MS.
 }
