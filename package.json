@@ -1,0 +1,39 @@
+{
+  "name": "klu-attend-plus",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "KLU Attend+ - Unofficial KLU Student Attendance Utility",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
+  },
+  "workspaces": [
+    "apps/web",
+    "apps/api",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "node ./scripts/ensure-port-free.mjs 3001 && concurrently -k -n WEB,API \"npm run dev --workspace apps/web\" \"npm run dev --workspace apps/api\"",
+    "build": "npm run build --workspace packages/shared-types && npm run build --workspace packages/attendance-engine && npm run build --workspace apps/api && npm run build --workspace apps/web",
+    "test": "npm run test --workspaces --if-present",
+    "test:e2e": "cd apps/web && npm run test:e2e",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspace packages/shared-types && npm run typecheck --workspace packages/attendance-engine && npm run typecheck --workspace apps/api && npm run typecheck --workspace apps/web",
+    "format": "prettier --write \"**/*.{ts,tsx,json,md}\"",
+    "clean": "npm run clean --workspaces --if-present && rm -rf node_modules package-lock.json",
+    "install:all": "npm install && npm install --workspace=packages/shared-types && npm install --workspace=packages/attendance-engine && npm install --workspace=apps/web && npm install --workspace=apps/api",
+    "dev:clean": "node ./scripts/ensure-port-free.mjs 3001",
+    "build:web": "npm run build --workspace=apps/web"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.3.0",
+    "concurrently": "^9.1.2"
+  }
+}

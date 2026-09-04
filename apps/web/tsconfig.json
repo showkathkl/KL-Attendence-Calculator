@@ -1,0 +1,38 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "lib": [
+      "ES2020",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "types": [
+      "node",
+      "react",
+      "react-dom"
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@/*": [
+        "./src/*"
+      ],
+      "@shared/*": [
+        "../../packages/shared-types/src/*"
+      ],
+      "@engine/*": [
+        "../../packages/attendance-engine/src/*"
+      ],
+      "@klu-attend-plus/attendance-engine": [
+        "../../packages/attendance-engine/src/index.ts"
+      ],
+      "@klu-attend-plus/shared-types": [
+        "../../packages/shared-types/src/index.ts"
+      ]
+    }
+  },
+  "include": [
+    "src"
+  ]
+}

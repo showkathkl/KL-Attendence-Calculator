@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">KLU Attend+ logo</title>
+  <desc id="desc">A teal square containing a white attendance check mark</desc>
+  <rect width="64" height="64" rx="16" fill="#0f4c5c"/>
+  <path d="M17 33.5 27 43l20-23" fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round" stroke-width="7"/>
+  <circle cx="49" cy="14" r="5" fill="#efb366"/>
+</svg>
